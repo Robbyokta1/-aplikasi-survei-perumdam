@@ -1,0 +1,352 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, addDoc, onSnapshot, query, orderBy, serverTimestamp } from 'firebase/firestore';
+
+// Main App component
+const App = () => {
+    // Define predefined categories and their costs
+    const categoryOptions = [
+        { id: '2inch_household', name: 'Pipa 2 Inci Rumah Tangga', totalCost: 1795500 },
+        { id: '3inch_household', name: 'Pipa 3 Inci Rumah Tangga', totalCost: 1839700 },
+        { id: '4inch_household', name: 'Pipa 4 Inci Rumah Tangga', totalCost: 1858700 },
+        // Categories for commercial
+        { id: '2inch_commercial', name: 'Pipa 2 Inci Niaga', totalCost: 1860900 },
+        { id: '3inch_commercial', name: 'Pipa 3 Inci Niaga', totalCost: 1904700 },
+        { id: '4inch_commercial', name: 'Pipa 4 Inci Niaga', totalCost: 1923700 },
+        // Categories for social umum/khusus
+        { id: '2inch_social', name: 'Pipa 2 Inci Sosial Umum/Khusus', totalCost: 1730900 },
+        { id: '3inch_social', name: 'Pipa 3 Inci Sosial Umum/Khusus', totalCost: 1774700 },
+        { id: '4inch_social', name: 'Pipa 4 Inci Sosial Umum/Khusus', totalCost: 1725700 },
+    ];
+
+    // State to store form data
+    const [formData, setFormData] = useState({
+        clientName: '',
+        clientPhone: '',
+        address: '',
+        surveyDate: new Date().toISOString().slice(0, 10), // Default to current date
+        selectedCategory: '2inch_household', // Default to the first predefined category
+        pipeLength: 0, // Total pipe length
+        isBelahJalanSelected: false, // State for 'Belah Jalan' option
+        concreteExcavationQuantity: 0, // State for concrete excavation quantity
+        soilExcavationQuantity: 0, // State for soil excavation quantity
+    });
+
+    // State to store calculated RAB
+    const [rab, setRab] = useState(null);
+    // State for loading indicator
+    const [isLoading, setIsLoading] = useState(false);
+    // State for success message
+    const [successMessage, setSuccessMessage] = useState('');
+    // State for error message
+    const [errorMessage, setErrorMessage] = useState('');
+    // State for saved survey records
+    const [savedRecords, setSavedRecords] = useState([]);
+    // State for Firebase instances and user ID
+    const [db, setDb] = useState(null);
+    const [auth, setAuth] = useState(null);
+    const [userId, setUserId] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+
+    // Define fixed costs
+    const BELAH_JALAN_COST = 250000;
+    const BASIC_ADDITIONAL_PIPE_COST_PER_METER = 10400; 
+    const CONNECTION_ADDITION_COST_PER_METER = 1500;
+    const CONCRETE_EXCAVATION_COST_PER_METER = 25000;
+    const SOIL_EXCAVATION_COST_PER_METER = 10000;
+    const CEMENT_COST_PER_KG = 2000;
+    const SAND_COST_PER_TIM = 10000;
+
+    // Firebase Initialization and Authentication
+    useEffect(() => {
+        try {
+            const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+            const app = initializeApp(firebaseConfig);
+            const firestoreDb = getFirestore(app);
+            const firebaseAuth = getAuth(app);
+
+            setDb(firestoreDb);
+            setAuth(firebaseAuth);
+
+            onAuthStateChanged(firebaseAuth, async (user) => {
+                if (user) {
+                    setUserId(user.uid);
+                } else {
+                    // Sign in anonymously if no custom token is provided
+                    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                        await signInWithCustomToken(firebaseAuth, __initial_auth_token);
+                        setUserId(firebaseAuth.currentUser?.uid);
+                    } else {
+                        await signInAnonymously(firebaseAuth);
+                        setUserId(firebaseAuth.currentUser?.uid);
+                    }
+                }
+                setIsAuthReady(true);
+            });
+        } catch (error) {
+            console.error("Error initializing Firebase:", error);
+            setErrorMessage("Gagal menginisialisasi Firebase. Silakan coba lagi.");
+        }
+    }, []);
+
+    // Fetch saved records when auth is ready and db is available
+    useEffect(() => {
+        if (isAuthReady && db && userId) {
+            const recordsCollectionRef = collection(db, `artifacts/${typeof __app_id !== 'undefined' ? __app_id : 'default-app-id'}/users/${userId}/surveyRecords`);
+            const q = query(recordsCollectionRef, orderBy('timestamp', 'desc')); // Order by timestamp
+
+            const unsubscribe = onSnapshot(q, (snapshot) => {
+                const records = snapshot.docs.map(doc => ({
+                    id: doc.id,
+                    ...doc.data()
+                }));
+                setSavedRecords(records);
+            }, (error) => {
+                console.error("Error fetching documents: ", error);
+                setErrorMessage("Gagal mengambil rekaman survei.");
+            });
+
+            return () => unsubscribe(); // Cleanup listener on unmount
+        }
+    }, [isAuthReady, db, userId]);
+
+    // Function to handle form input changes
+    const handleChange = (e) => {
+        const { name, value, type, checked } = e.target;
+        setFormData(prevData => ({
+            ...prevData,
+            [name]: type === 'checkbox' ? checked : (type === 'number' ? parseFloat(value) : value)
+        }));
+    };
+
+    // Function to calculate RAB
+    const calculateRAB = () => {
+        const { selectedCategory, pipeLength, isBelahJalanSelected, concreteExcavationQuantity, soilExcavationQuantity } = formData;
+
+        const selectedOption = categoryOptions.find(option => option.id === selectedCategory);
+        if (selectedOption) {
+            let baseTotalCost = selectedOption.totalCost;
+            let details = [
+                { item: `Pemasangan ${selectedOption.name}`, quantity: 1, unit: 'paket', unitPrice: selectedOption.totalCost, total: selectedOption.totalCost },
+            ];
+
+            // Calculate additional costs if pipe length is greater than 6 meters
+            if (pipeLength > 6) {
+                const excessLength = pipeLength - 6;
+                
+                // 1. Biaya Tambahan Panjang Pipa (material/dasar)
+                const basicAdditionalCost = excessLength * BASIC_ADDITIONAL_PIPE_COST_PER_METER;
+                baseTotalCost += basicAdditionalCost;
+                details.push({
+                    item: `Biaya Tambahan Panjang Pipa (> 6m)`,
+                    quantity: excessLength,
+                    unit: 'meter',
+                    unitPrice: BASIC_ADDITIONAL_PIPE_COST_PER_METER,
+                    total: basicAdditionalCost
+                });
+
+                // 2. Biaya Penyambungan & Penambahan Pipa (pekerjaan)
+                const connectionAdditionCost = excessLength * CONNECTION_ADDITION_COST_PER_METER;
+                baseTotalCost += connectionAdditionCost;
+                details.push({
+                    item: `Biaya Penyambungan & Penambahan Pipa (> 6m)`,
+                    quantity: excessLength,
+                    unit: 'meter',
+                    unitPrice: CONNECTION_ADDITION_COST_PER_METER,
+                    total: connectionAdditionCost
+                });
+            }
+
+            // Add 'Belah Jalan' cost if selected
+            if (isBelahJalanSelected) {
+                baseTotalCost += BELAH_JALAN_COST;
+                details.push({
+                    item: `Belah Jalan`,
+                    quantity: 1,
+                    unit: 'ls',
+                    unitPrice: BELAH_JALAN_COST,
+                    total: BELAH_JALAN_COST
+                });
+            }
+
+            // Calculate and add Concrete Excavation Cost
+            if (concreteExcavationQuantity > 0) {
+                const concreteExcavationCost = concreteExcavationQuantity * CONCRETE_EXCAVATION_COST_PER_METER;
+                baseTotalCost += concreteExcavationCost;
+                details.push({
+                    item: `Biaya Galian Beton`,
+                    quantity: concreteExcavationQuantity,
+                    unit: 'meter',
+                    unitPrice: CONCRETE_EXCAVATION_COST_PER_METER,
+                    total: concreteExcavationCost
+                });
+
+                // Calculate and add Cement Cost based on Concrete Excavation Quantity
+                const cementQuantity = concreteExcavationQuantity; // Assuming 1 meter concrete excavation needs 1 kg cement
+                const cementCost = cementQuantity * CEMENT_COST_PER_KG;
+                baseTotalCost += cementCost;
+                details.push({
+                    item: `Biaya Semen (untuk Galian Beton)`,
+                    quantity: cementQuantity,
+                    unit: 'kg',
+                    unitPrice: CEMENT_COST_PER_KG,
+                    total: cementCost
+                });
+
+                // Calculate and add Sand Cost based on Concrete Excavation Quantity
+                const sandQuantity = concreteExcavationQuantity * 0.5; // 0.5 Tim per meter of concrete excavation
+                const sandCost = sandQuantity * SAND_COST_PER_TIM;
+                baseTotalCost += sandCost;
+                details.push({
+                    item: `Biaya Pasir (untuk Galian Beton)`,
+                    quantity: sandQuantity,
+                    unit: 'Tim',
+                    unitPrice: SAND_COST_PER_TIM,
+                    total: sandCost
+                });
+            }
+
+            // Calculate and add Soil Excavation Cost
+            if (soilExcavationQuantity > 0) {
+                const soilExcavationCost = soilExcavationQuantity * SOIL_EXCAVATION_COST_PER_METER;
+                baseTotalCost += soilExcavationCost;
+                details.push({
+                    item: `Biaya Galian Tanah`,
+                    quantity: soilExcavationQuantity,
+                    unit: 'meter',
+                    unitPrice: SOIL_EXCAVATION_COST_PER_METER,
+                    total: soilExcavationCost
+                });
+            }
+            
+            const calculatedRab = {
+                category: selectedOption.name,
+                materialCost: 0, // Not detailed for fixed categories
+                laborCost: 0,   // Not detailed for fixed categories
+                totalCost: baseTotalCost,
+                details: details
+            };
+            setRab(calculatedRab);
+            return calculatedRab; // Return calculated RAB for saving
+        }
+        return null;
+    };
+
+    // Function to save RAB to Firestore
+    const saveRABToFirestore = async (calculatedRab) => {
+        if (!db || !userId || !calculatedRab) {
+            setErrorMessage("Database belum siap atau RAB belum dihitung.");
+            return;
+        }
+
+        setIsLoading(true);
+        try {
+            const recordsCollectionRef = collection(db, `artifacts/${typeof __app_id !== 'undefined' ? __app_id : 'default-app-id'}/users/${userId}/surveyRecords`);
+            await addDoc(recordsCollectionRef, {
+                formData: formData,
+                rab: calculatedRab,
+                timestamp: serverTimestamp()
+            });
+            setSuccessMessage('RAB berhasil disimpan ke database!');
+        } catch (error) {
+            console.error("Error saving document: ", error);
+            setErrorMessage("Gagal menyimpan RAB ke database. Silakan coba lagi.");
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    // Function to handle form submission
+    const handleSubmit = async (e) => {
+        e.preventDefault();
+        setIsLoading(true);
+        setSuccessMessage('');
+        setErrorMessage('');
+
+        const calculatedRab = calculateRAB(); // Calculate RAB first
+        if (calculatedRab) {
+            await saveRABToFirestore(calculatedRab); // Then save it
+        }
+        setIsLoading(false);
+    };
+
+    // Function to generate WhatsApp message
+    const generateWhatsAppMessage = () => {
+        if (!rab) return '';
+
+        let message = `Halo Bapak/Ibu ${formData.clientName},\n\n`;
+        message += `Berikut adalah Rencana Anggaran Biaya (RAB) pemasangan SR Perumdam Tirta Terubuk untuk alamat ${formData.address} pada tanggal ${formData.surveyDate}:\n\n`;
+
+        message += `Kategori Pemasangan: ${rab.category}\n\n`;
+
+        message += `Detail RAB:\n`;
+        rab.details.forEach(item => {
+            message += `- ${item.item}: ${item.quantity} ${item.unit} x Rp ${item.unitPrice.toLocaleString('id-ID')} = Rp ${item.total.toLocaleString('id-ID')}\n`;
+        });
+        
+        message += `Total Keseluruhan Biaya: Rp ${rab.totalCost.toLocaleString('id-ID')}\n\n`;
+        message += `Terima kasih atas kepercayaan Anda kepada Perumdam Tirta Terubuk.`;
+
+        return encodeURIComponent(message);
+    };
+
+    // Function to open WhatsApp chat
+    const sendWhatsApp = () => {
+        if (!rab || !formData.clientPhone) {
+            setErrorMessage('RAB belum dihitung atau nomor telepon klien belum diisi.');
+            return;
+        }
+        const whatsappMessage = generateWhatsAppMessage();
+        // WhatsApp API for sending message
+        const whatsappUrl = `https://wa.me/${formData.clientPhone}?text=${whatsappMessage}`;
+        window.open(whatsappUrl, '_blank');
+        setSuccessMessage('Pesan WhatsApp telah dibuka. Silakan kirimkan kepada klien.');
+    };
+
+    return (
+        <div className="min-h-screen bg-gradient-to-br from-blue-100 to-blue-300 flex items-center justify-center p-4 font-inter">
+            <div className="bg-white p-8 rounded-xl shadow-2xl w-full max-w-2xl transform transition-all duration-300 hover:scale-105">
+                <h1 className="text-3xl font-bold text-center text-blue-800 mb-6">Survei Opname Pemasangan SR</h1>
+                <p className="text-center text-gray-600 mb-4">Perumdam Tirta Terubuk</p>
+                {userId && <p className="text-center text-sm text-gray-500 mb-6">ID Pengguna Anda: {userId}</p>}
+
+                {/* Survey Form */}
+                <form onSubmit={handleSubmit} className="space-y-4">
+                    <div>
+                        <label htmlFor="clientName" className="block text-sm font-medium text-gray-700">Nama Klien</label>
+                        <input
+                            type="text"
+                            id="clientName"
+                            name="clientName"
+                            value={formData.clientName}
+                            onChange={handleChange}
+                            required
+                            className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+                        />
+                    </div>
+                    <div>
+                        <label htmlFor="clientPhone" className="block text-sm font-medium text-gray-700">Nomor Telepon Klien (WhatsApp)</label>
+                        <input
+                            type="tel"
+                            id="clientPhone"
+                            name="clientPhone"
+                            value={formData.clientPhone}
+                            onChange={handleChange}
+                            placeholder="Contoh: 6281234567890"
+                            required
+                            className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+                        />
+                    </div>
+                    <div>
+                        <label htmlFor="address" className="block text-sm font-medium text-gray-700">Alamat Pemasangan</label>
+                        <textarea
+                            id="address"
+                            name="address"
+                            value={formData.address}
+                            onChange={handleChange}
+                            rows="3"
+                            required
+                            className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+                        ></textarea>
+                    </d
